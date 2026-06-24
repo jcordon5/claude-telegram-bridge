@@ -1,0 +1,7 @@
+# Local secrets — never publish (bot token, chat ids).
+.env
+
+# Python / OS junk
+__pycache__/
+*.pyc
+.DS_Store
