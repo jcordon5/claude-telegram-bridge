@@ -89,6 +89,7 @@ INBOX_DIR = STATE_DIR / "inbox"        # <name>/<seq>.txt        → queued mess
 MSGMAP_PATH = STATE_DIR / "msgmap.json"  # {message_id: {"session": str, "ts": float}}
 ACTIVE_PATH = STATE_DIR / "active_target"  # plain text: last selected session
 BROKER_PID = STATE_DIR / "broker.pid"  # liveness of the broker
+OFFSET_PATH = STATE_DIR / "offset"     # last consumed getUpdates offset (survives restarts)
 HEARTBEAT_TTL = 90.0                   # a session is "live" if its heartbeat is younger
 STOP_TOKEN = "\x00__STOP__"            # enqueued sentinel that tells a session to stop
 
@@ -355,6 +356,24 @@ def cmd_ask(
 
 
 _STOP_WORDS = {"/stop", "stop", "para", "parar", "detente", "stop listening", "deja de escuchar"}
+_STOP_ALL_WORDS = {
+    "/stopall", "stop all", "stopall", "para todo", "parar todo", "stop todo",
+    "detener todo", "para todas", "parar todas", "stop all sessions",
+}
+
+
+def _save_offset(offset: int) -> None:
+    _state_init()
+    OFFSET_PATH.write_text(str(offset), encoding="utf-8")
+
+
+def _load_offset() -> int | None:
+    if OFFSET_PATH.exists():
+        try:
+            return int(OFFSET_PATH.read_text(encoding="utf-8").strip())
+        except ValueError:
+            return None
+    return None
 
 
 def cmd_listen(
@@ -445,8 +464,13 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
     # so the daemon never lingers forever after everyone is done.
     idle_shutdown = float(os.environ.get("TELEGRAM_BROKER_IDLE", "900"))
     last_active = time.time()
+    announced_multi = False
     try:
-        offset = _latest_offset(token)
+        # Resume from the saved offset so messages sent while the broker was down
+        # are still delivered on restart; skip backlog only on the very first run.
+        offset = _load_offset()
+        if offset is None:
+            offset = _latest_offset(token)
         while True:
             res = _call(
                 token,
@@ -457,7 +481,24 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
             for up in res.get("result", []):
                 offset = up["update_id"] + 1
                 _handle_update(token, chat, allowed, up)
-            if _live_sessions():
+                _save_offset(offset)
+            live = _live_sessions()
+            # (a) One-time heads-up the moment a second session shows up.
+            if len(live) >= 2 and not announced_multi:
+                active = _get_active() or live[-1]
+                _send(
+                    token,
+                    chat,
+                    "ℹ️ Ahora hay varias sesiones activas: "
+                    + ", ".join(live)
+                    + f".\nTus mensajes van a la última con la que hablaste ({active}). "
+                    "Para cambiar: responde a un mensaje de la otra sesión, escribe "
+                    "'nombre: …' o usa /sessions. Para parar todas: 'para todo'.",
+                )
+                announced_multi = True
+            elif len(live) <= 1:
+                announced_multi = False  # re-arm for the next time it grows
+            if live:
                 last_active = time.time()
             elif time.time() - last_active > idle_shutdown:
                 break
@@ -497,6 +538,13 @@ def _handle_update(token: str, chat: str, allowed: set[str], up: dict) -> None:
         return
 
     live = _live_sessions()
+
+    # stop-all → stop every live session at once
+    if text.lower() in _STOP_ALL_WORDS:
+        for name in live:
+            _enqueue(name, STOP_TOKEN)
+        _send(token, chat, f"🛑 Detenidas todas las sesiones ({', '.join(live) or '—'}).")
+        return
 
     # 3. menu command
     if text.lower() in ("/sessions", "/sesiones", "/s"):

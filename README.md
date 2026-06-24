@@ -95,8 +95,11 @@ router (broker) behind the scenes, names each session after its project folder,
 and tags messages `[folder] …` so you always know who's talking.
 
 To target a session from Telegram: **reply** to one of its messages, prefix with
-`folder: …`, or send `/sessions` for a tap-to-pick menu. Stop words stop that
-session. (`TELEGRAM_NO_BROKER=1` forces the old single-session mode.)
+`folder: …`, or send `/sessions` for a tap-to-pick menu. `stop`/`para` stops that
+session; `para todo` / `stop all` stops every session. When a second session
+appears you get a one-time heads-up explaining how to switch, and messages aren't
+lost if the router briefly restarts. (`TELEGRAM_NO_BROKER=1` forces the old
+single-session mode.)
 
 Claude picks all this up automatically from `SKILL.md`; you mostly just need the
 one-time setup above.

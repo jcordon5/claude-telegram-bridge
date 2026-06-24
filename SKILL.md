@@ -234,8 +234,16 @@ The user targets a session from Telegram by (in priority order):
 1. **Reply** to one of its tagged messages → that session (cleanest, zero typing).
 2. **`name: ...`** prefix where `name` is a live session.
 3. **`/sessions`** → inline-keyboard menu to pick the active session.
-4. **stop word** → stops the targeted/active session.
+4. **stop word** (`stop`/`para`) → stops the targeted/active session; **`para todo`
+   / `stop all`** stops every live session at once.
 5. otherwise → the active session, or the only live one; if ambiguous it asks.
+
+The broker is **informative**: it sends a one-time heads-up the moment a second
+session appears (so the user learns, in that moment, that messages go to the last
+session and how to switch), and acks each routed message with its `[name]`. It
+also **persists its read offset**, so messages the user sends while the broker is
+briefly down are delivered when it comes back (not lost), without replaying old
+history.
 
 Overrides (rarely needed): `--session NAME` (or `TELEGRAM_SESSION`) to set the
 name explicitly; `TELEGRAM_NO_BROKER=1` to force the old direct single-session
