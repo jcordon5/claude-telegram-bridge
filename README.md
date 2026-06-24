@@ -64,11 +64,28 @@ python3 scripts/telegram.py status        # is it configured?
 python3 scripts/telegram.py chat-id       # discover chat ids
 python3 scripts/telegram.py notify "..."  # progress / info (non-blocking)
 python3 scripts/telegram.py ask "..."     # ask + WAIT; prints the reply to stdout
+python3 scripts/telegram.py listen        # WAIT for your next message (run in background)
 python3 scripts/telegram.py test          # end-to-end check
 ```
 
-`ask` exit codes: `0` answered (reply on stdout), `3` timed out (don't assume —
-park the work), `2` not configured.
+`ask`/`listen` exit codes: `0` answered (reply/message on stdout), `3` timed out,
+`2` not configured. `listen` also returns `4` when you send a stop word.
+
+## Drive Claude from Telegram (send it prompts from your phone)
+
+You don't only receive updates — you can **send Claude new instructions from
+Telegram**, as if you typed them in the app. Claude runs `listen` in the
+background; it long-polls Telegram for free (no model tokens while it waits) and
+wakes Claude only when your message arrives. Then Claude does it, replies on
+Telegram, and listens again. So cost scales with the number of messages you
+send, not with idle time.
+
+- **Use it:** ask Claude to "listen on Telegram" (or it offers it for unattended
+  work). Then just message the bot whatever you want done.
+- **Stop it:** send `stop`, `para`, `/stop`, `parar` or `detente`.
+- **Note:** it runs inside your normal Claude session/quota — a Telegram message
+  is billed exactly like typing the same prompt in the app. The machine running
+  Claude must stay on while you're away.
 
 Claude picks all this up automatically from `SKILL.md`; you mostly just need the
 one-time setup above.

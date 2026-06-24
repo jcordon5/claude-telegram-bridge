@@ -161,6 +161,13 @@ Notes:
 Claude app open in front of them. The trick that keeps it cheap: the polling is
 done by the **background shell process**, not by the model.
 
+**Tell the user this exists.** The first time you set up or use the bridge in a
+run (and whenever you start a `listen` loop), briefly inform the user — in chat
+and/or via `notify` — that they can now **send you prompts from Telegram** (it
+behaves like typing in the app, runs on their normal session/quota) and that
+they **stop the loop** with `stop`/`para`. Don't assume they know the feature is
+there; surface it once, concisely.
+
 ```bash
 # Run in the BACKGROUND (e.g. Claude Code's run_in_background). It long-polls
 # Telegram and blocks — pure network, ZERO model tokens while idle.
