@@ -462,7 +462,7 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
     BROKER_PID.write_text(str(os.getpid()), encoding="utf-8")
     # Idle self-shutdown: exit quietly once no session has been live for a while,
     # so the daemon never lingers forever after everyone is done.
-    idle_shutdown = float(os.environ.get("TELEGRAM_BROKER_IDLE", "900"))
+    idle_shutdown = float(os.environ.get("TELEGRAM_BROKER_IDLE", "3600"))
     last_active = time.time()
     announced_multi = False
     try:
@@ -508,11 +508,16 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
 
 
 def _menu(token: str, chat: str) -> None:
-    live = _live_sessions()
-    if not live:
-        _send(token, chat, "No hay sesiones activas ahora mismo.")
+    # Show live sessions plus the active one (it may be momentarily down), so the
+    # menu isn't empty during a brief listener blip.
+    names = list(_live_sessions())
+    active = _get_active()
+    if active and active not in names:
+        names.append(active)
+    if not names:
+        _send(token, chat, "No hay sesiones todavía.")
         return
-    keyboard = [[{"text": n, "callback_data": f"sess:{n}"}] for n in live]
+    keyboard = [[{"text": n, "callback_data": f"sess:{n}"}] for n in names]
     _send_id(token, chat, "Elige la sesión destino:", json.dumps({"inline_keyboard": keyboard}))
 
 
@@ -564,10 +569,12 @@ def _handle_update(token: str, chat: str, allowed: set[str], up: dict) -> None:
     # 4. stop word
     is_stop = text.lower() in _STOP_WORDS
 
-    # 5. fallback to active / sole live session
+    # 5. fallback: the last session you talked to (even if its listener is
+    #    momentarily down — the message queues and is delivered when it relaunches),
+    #    else the only live one. Only truly ambiguous when nothing is known.
     if target is None:
         active = _get_active()
-        if active in live:
+        if active:
             target = active
         elif len(live) == 1:
             target = live[0]
