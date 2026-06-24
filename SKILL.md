@@ -24,6 +24,24 @@ without you guessing on decisions that are theirs to make.
 
 All logic is in `scripts/telegram.py` (stdlib only, no installs).
 
+## Golden rule — once this skill is in use, ask ONLY via Telegram
+
+While you are using this skill (the user asked you to work via Telegram, or you
+sent a Telegram `notify`/`ask` this run), **every question, confirmation, choice,
+or missing-context request MUST go through `ask` on Telegram — never through the
+Claude chat UI** (no in-chat questions, no AskUserQuestion-style prompts, no
+"stopping to ask in the response"). The whole point is that the user may be away
+from the computer with **only Telegram access**: a question posted in the chat
+would block the run forever because they can't see or answer it there.
+
+Concretely:
+- Need a decision? → `ask` on Telegram and act on the reply. Do **not** also ask
+  in chat, and do **not** pause expecting a chat answer.
+- `ask` timed out (exit code 3)? → don't assume; park that piece as blocked and
+  continue with unblocked work, or stop and report **via `notify`**.
+- Before ending a turn during an unattended run, send a `notify` so the user can
+  redirect from Telegram if they want.
+
 ## Install
 
 Primary (recommended):
