@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -192,6 +193,59 @@ def _broker_alive() -> bool:
         return False
 
 
+def _broker_enabled() -> bool:
+    """Broker mode is the default (plug & play); TELEGRAM_NO_BROKER=1 opts out."""
+    return os.environ.get("TELEGRAM_NO_BROKER", "0").strip().lower() not in ("1", "true", "yes")
+
+
+def _default_session() -> str:
+    """Stable per-session name with no user effort: the project directory name.
+
+    One Claude session usually maps to one project dir, so this is stable across
+    relaunches and naturally distinct between sessions. Override with --session
+    or TELEGRAM_SESSION when two sessions share a directory.
+    """
+    return (os.environ.get("TELEGRAM_SESSION") or Path.cwd().name or "default").strip()
+
+
+def _ensure_broker() -> bool:
+    """Start a detached broker if none is alive. Idempotent and race-safe.
+
+    The broker is spawned in its own session (``start_new_session``) so it
+    outlives the Claude session that triggered it and keeps routing for every
+    other session. Returns True once a broker is available.
+    """
+    if _broker_alive():
+        return True
+    _state_init()
+    lock = STATE_DIR / "broker.starting"
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        for _ in range(50):  # another caller is starting it — wait for it
+            if _broker_alive():
+                return True
+            time.sleep(0.1)
+        return _broker_alive()
+    try:
+        logf = open(STATE_DIR / "broker.log", "ab")
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "broker"],
+            stdout=logf,
+            stderr=logf,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        for _ in range(50):
+            if _broker_alive():
+                return True
+            time.sleep(0.1)
+        return _broker_alive()
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def _call(token: str, method: str, params: dict | None = None, timeout: int = 70):
     url = API.format(token=token, method=method)
     data = urllib.parse.urlencode(params or {}).encode()
@@ -256,6 +310,8 @@ def cmd_chat_id(token: str) -> int:
 def cmd_notify(token: str, chat: str, text: str, session: str | None = None) -> int:
     if session:
         # Tag the message and remember its id so a reply routes back here.
+        if _broker_enabled():
+            _ensure_broker()  # so a reply to this message can be routed
         mid = _send_id(token, chat, f"[{session}] {text}")
         _record_msgmap(mid, session)
     else:
@@ -269,8 +325,8 @@ def cmd_ask(
     if session:
         # Broker mode: send the (tagged) question, then wait on our inbox — the
         # broker owns getUpdates, so we must not poll it ourselves.
-        if not _broker_alive():
-            sys.stderr.write("No broker running. Start one with: telegram.py broker\n")
+        if not _ensure_broker():
+            sys.stderr.write("Could not start the broker.\n")
             return 2
         mid = _send_id(token, chat, f"❓ [{session}] {question}\n\n(Responde a este mensaje.)")
         _record_msgmap(mid, session)
@@ -314,9 +370,10 @@ def cmd_listen(
       - returns 3                             → timed out with no message
     """
     if session:
-        # Broker mode: register and wait on our local inbox (the broker routes).
-        if not _broker_alive():
-            sys.stderr.write("No broker running. Start one with: telegram.py broker\n")
+        # Broker mode (default): auto-start the broker if needed, then wait on
+        # our local inbox while the broker routes Telegram messages to us.
+        if not _ensure_broker():
+            sys.stderr.write("Could not start the broker.\n")
             return 2
         _heartbeat(session)
         return _wait_inbox(session, timeout)
@@ -384,9 +441,12 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
         return 1
     _state_init()
     BROKER_PID.write_text(str(os.getpid()), encoding="utf-8")
+    # Idle self-shutdown: exit quietly once no session has been live for a while,
+    # so the daemon never lingers forever after everyone is done.
+    idle_shutdown = float(os.environ.get("TELEGRAM_BROKER_IDLE", "900"))
+    last_active = time.time()
     try:
         offset = _latest_offset(token)
-        _send(token, chat, "🧭 Broker activo. Enrutado multi-sesión en marcha.")
         while True:
             res = _call(
                 token,
@@ -397,8 +457,13 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
             for up in res.get("result", []):
                 offset = up["update_id"] + 1
                 _handle_update(token, chat, allowed, up)
+            if _live_sessions():
+                last_active = time.time()
+            elif time.time() - last_active > idle_shutdown:
+                break
     finally:
         BROKER_PID.unlink(missing_ok=True)
+    return 0
 
 
 def _menu(token: str, chat: str) -> None:
@@ -518,13 +583,20 @@ def main(argv: list[str]) -> int:
             return args[i + 1], args[:i] + args[i + 2 :]
         return None, args
 
+    # Broker mode is the default: when enabled and no explicit --session is
+    # given, derive a stable one from the project dir so it's plug & play.
+    def _eff_session(explicit: str | None) -> str | None:
+        if explicit:
+            return explicit
+        return _default_session() if _broker_enabled() else None
+
     if cmd == "notify":
         args = argv[1:]
         session, args = _pop(args, "--session")
         if not args:
             sys.stderr.write("Usage: telegram.py notify <text> [--session NAME]\n")
             return 2
-        return cmd_notify(token, chat, " ".join(args), session)
+        return cmd_notify(token, chat, " ".join(args), _eff_session(session))
 
     if cmd == "ask":
         args = argv[1:]
@@ -534,17 +606,27 @@ def main(argv: list[str]) -> int:
         if not args:
             sys.stderr.write("Usage: telegram.py ask <question> [--timeout N] [--session NAME]\n")
             return 2
-        return cmd_ask(token, chat, allowed, " ".join(args), timeout, session)
+        return cmd_ask(token, chat, allowed, " ".join(args), timeout, _eff_session(session))
 
     if cmd == "listen":
         args = argv[1:]
         session, args = _pop(args, "--session")
         to, args = _pop(args, "--timeout")
         timeout = int(to) if to else int(os.environ.get("TELEGRAM_LISTEN_TIMEOUT", "21600"))
-        return cmd_listen(token, chat, allowed, timeout, session)
+        return cmd_listen(token, chat, allowed, timeout, _eff_session(session))
 
     if cmd == "broker":
         return cmd_broker(token, chat, allowed)
+
+    if cmd == "broker-stop":
+        if not _broker_alive():
+            print("No broker running.")
+            return 0
+        import signal
+
+        os.kill(int(BROKER_PID.read_text().strip()), signal.SIGTERM)
+        print("Broker stopped.")
+        return 0
 
     if cmd == "sessions":
         print("\n".join(_live_sessions()) or "(no live sessions)")

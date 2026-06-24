@@ -211,35 +211,33 @@ Mostly no, with three caveats:
 - Locally: stop/kill the background `listen` task (e.g. Claude Code's task-stop),
   or just don't relaunch it after the next message.
 
-### Multiple sessions at once (broker)
+### Multiple sessions — automatic (plug & play, on by default)
 
-One bot can drive several Claude sessions without a bot-per-session. The problem
-with N independent `listen`s on one bot is that `getUpdates` is consume-once, so
-they would race for messages. The fix is a **broker**: a single background
-process that owns `getUpdates` and routes each message to the right session's
-local inbox. Each session then waits on its inbox instead of polling Telegram.
+You **don't manage any of this**. Multi-session routing is the default: just use
+`notify` / `ask` / `listen` exactly as above and the skill takes care of it.
+
+Under the hood, the first command that needs it **auto-starts a detached broker**
+(a single `getUpdates` consumer, so N sessions never race the consume-once
+queue), each session **auto-names itself** after its project directory, and
+outbound messages are **auto-tagged** `[name]`. The broker survives the session
+that spawned it and **shuts itself down** once no session has been live for a
+while. State lives in `~/.telegram-bridge/` (outside any repo).
+
+So in practice, per session, this is all you run — same as single-session:
 
 ```bash
-# 1) Start ONE broker (background). It is the only getUpdates consumer.
-python3 .../scripts/telegram.py broker
-
-# 2) Each session listens under a name (background), and tags its outbound msgs.
-python3 .../scripts/telegram.py listen --session m3
-python3 .../scripts/telegram.py notify "tests verdes" --session m3   # → "[m3] tests verdes"
-python3 .../scripts/telegram.py ask "¿genero el doc?" --session front
+python3 .../scripts/telegram.py listen            # auto: broker + session = dir name
+python3 .../scripts/telegram.py notify "tests ok"  # auto-tagged "[DCIBERID] tests ok"
 ```
 
-How the broker routes an incoming message (in order):
-1. **Reply** to a tagged message → that message's session (cleanest; zero typing).
-2. **`name: ...`** prefix where `name` is a live session → that session.
-3. **`/sessions`** → an inline-keyboard menu of live sessions; tapping one sets it
-   as the active target.
+The user targets a session from Telegram by (in priority order):
+1. **Reply** to one of its tagged messages → that session (cleanest, zero typing).
+2. **`name: ...`** prefix where `name` is a live session.
+3. **`/sessions`** → inline-keyboard menu to pick the active session.
 4. **stop word** → stops the targeted/active session.
-5. otherwise → the active session (or the only live one); if ambiguous it asks.
+5. otherwise → the active session, or the only live one; if ambiguous it asks.
 
-Every outbound `notify`/`ask --session X` is prefixed `[X]` so the user always
-knows which session is talking, and its message id is remembered so a reply
-routes back to X automatically. State lives in `~/.telegram-bridge/` (outside any
-repo). The broker lives in the session that started it; keep that session alive.
-Without a broker, `--session` commands error and the plain single-session
-commands keep working as before.
+Overrides (rarely needed): `--session NAME` (or `TELEGRAM_SESSION`) to set the
+name explicitly; `TELEGRAM_NO_BROKER=1` to force the old direct single-session
+mode; `telegram.py broker-stop` to stop the daemon now; `telegram.py sessions`
+to list live ones.

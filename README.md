@@ -87,20 +87,16 @@ send, not with idle time.
   is billed exactly like typing the same prompt in the app. The machine running
   Claude must stay on while you're away.
 
-### Multiple sessions at once
+### Multiple sessions at once (automatic)
 
-You don't need a separate bot per Claude session. Start one **broker** and give
-each session a name; the broker (the only `getUpdates` consumer, so no races)
-routes each message to the right one:
+One bot drives many Claude sessions with **zero setup** — it's on by default.
+Each session just uses `notify`/`listen` as usual; the skill auto-starts a single
+router (broker) behind the scenes, names each session after its project folder,
+and tags messages `[folder] …` so you always know who's talking.
 
-```bash
-python3 scripts/telegram.py broker                 # run once, in the background
-python3 scripts/telegram.py listen --session m3    # each session, in the background
-```
-
-- Outbound messages are tagged `[m3] …` so you always know who's talking.
-- To target a session: **reply** to one of its messages, prefix with `m3: …`,
-  or send `/sessions` for a tap-to-pick menu. Stop words stop that session.
+To target a session from Telegram: **reply** to one of its messages, prefix with
+`folder: …`, or send `/sessions` for a tap-to-pick menu. Stop words stop that
+session. (`TELEGRAM_NO_BROKER=1` forces the old single-session mode.)
 
 Claude picks all this up automatically from `SKILL.md`; you mostly just need the
 one-time setup above.
