@@ -210,3 +210,36 @@ Mostly no, with three caveats:
 - From Telegram: send `stop` / `para` / `/stop` → clean end (exit 4).
 - Locally: stop/kill the background `listen` task (e.g. Claude Code's task-stop),
   or just don't relaunch it after the next message.
+
+### Multiple sessions at once (broker)
+
+One bot can drive several Claude sessions without a bot-per-session. The problem
+with N independent `listen`s on one bot is that `getUpdates` is consume-once, so
+they would race for messages. The fix is a **broker**: a single background
+process that owns `getUpdates` and routes each message to the right session's
+local inbox. Each session then waits on its inbox instead of polling Telegram.
+
+```bash
+# 1) Start ONE broker (background). It is the only getUpdates consumer.
+python3 .../scripts/telegram.py broker
+
+# 2) Each session listens under a name (background), and tags its outbound msgs.
+python3 .../scripts/telegram.py listen --session m3
+python3 .../scripts/telegram.py notify "tests verdes" --session m3   # → "[m3] tests verdes"
+python3 .../scripts/telegram.py ask "¿genero el doc?" --session front
+```
+
+How the broker routes an incoming message (in order):
+1. **Reply** to a tagged message → that message's session (cleanest; zero typing).
+2. **`name: ...`** prefix where `name` is a live session → that session.
+3. **`/sessions`** → an inline-keyboard menu of live sessions; tapping one sets it
+   as the active target.
+4. **stop word** → stops the targeted/active session.
+5. otherwise → the active session (or the only live one); if ambiguous it asks.
+
+Every outbound `notify`/`ask --session X` is prefixed `[X]` so the user always
+knows which session is talking, and its message id is remembered so a reply
+routes back to X automatically. State lives in `~/.telegram-bridge/` (outside any
+repo). The broker lives in the session that started it; keep that session alive.
+Without a broker, `--session` commands error and the plain single-session
+commands keep working as before.

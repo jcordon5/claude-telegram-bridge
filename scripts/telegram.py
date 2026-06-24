@@ -26,6 +26,16 @@ Commands:
   telegram.py ask "question" [--timeout N] # ask + WAIT; prints the reply on stdout
   telegram.py listen [--timeout N]        # WAIT for the next user msg (run in background)
   telegram.py test                        # end-to-end check (notify + ask round-trip)
+
+Multi-session (optional): run ONE `broker` (background) and have each session use
+`--session NAME` on notify/ask/listen. The broker owns getUpdates and routes each
+incoming message to the right session (reply-to a tagged msg, "name: ..." prefix,
+/sessions menu, or the active one). Without a broker, the single-session commands
+above work exactly as before.
+  telegram.py broker                      # single consumer that routes to sessions
+  telegram.py sessions                    # list live sessions
+  telegram.py notify "text" --session m3  # tagged "[m3] text" (reply routes back)
+  telegram.py listen --session m3         # wait for messages routed to "m3"
 """
 
 from __future__ import annotations
@@ -66,6 +76,122 @@ def _load_config() -> tuple[str, str, set[str]]:
     return token, chat, allowed
 
 
+# ---------------------------------------------------------------------------
+# Multi-session state (broker mode). Lives OUTSIDE the skill's git repo.
+# A single `broker` process owns getUpdates (no race) and routes each incoming
+# message to the right session's local inbox; sessions wait on their inbox.
+# ---------------------------------------------------------------------------
+
+STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR") or (Path.home() / ".telegram-bridge"))
+SESS_DIR = STATE_DIR / "sessions"      # heartbeat: <name>.json  → {"ts": ...}
+INBOX_DIR = STATE_DIR / "inbox"        # <name>/<seq>.txt        → queued messages
+MSGMAP_PATH = STATE_DIR / "msgmap.json"  # {message_id: {"session": str, "ts": float}}
+ACTIVE_PATH = STATE_DIR / "active_target"  # plain text: last selected session
+BROKER_PID = STATE_DIR / "broker.pid"  # liveness of the broker
+HEARTBEAT_TTL = 90.0                   # a session is "live" if its heartbeat is younger
+STOP_TOKEN = "\x00__STOP__"            # enqueued sentinel that tells a session to stop
+
+
+def _state_init() -> None:
+    for d in (STATE_DIR, SESS_DIR, INBOX_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _heartbeat(name: str) -> None:
+    _state_init()
+    (SESS_DIR / f"{name}.json").write_text(json.dumps({"ts": time.time()}), encoding="utf-8")
+
+
+def _live_sessions() -> list[str]:
+    if not SESS_DIR.exists():
+        return []
+    out = []
+    now = time.time()
+    for f in sorted(SESS_DIR.glob("*.json")):
+        try:
+            ts = json.loads(f.read_text(encoding="utf-8")).get("ts", 0)
+        except (OSError, ValueError):
+            continue
+        if now - ts <= HEARTBEAT_TTL:
+            out.append(f.stem)
+    return out
+
+
+def _enqueue(name: str, text: str) -> None:
+    box = INBOX_DIR / name
+    box.mkdir(parents=True, exist_ok=True)
+    # Monotonic-ish name so dequeue order is FIFO even within the same second.
+    seq = f"{time.time():.6f}_{os.getpid()}"
+    (box / f"{seq}.txt").write_text(text, encoding="utf-8")
+
+
+def _dequeue(name: str) -> str | None:
+    box = INBOX_DIR / name
+    if not box.exists():
+        return None
+    files = sorted(box.glob("*.txt"))
+    if not files:
+        return None
+    f = files[0]
+    try:
+        text = f.read_text(encoding="utf-8")
+    finally:
+        f.unlink(missing_ok=True)
+    return text
+
+
+def _record_msgmap(message_id, session: str) -> None:
+    if message_id is None:
+        return
+    _state_init()
+    try:
+        data = json.loads(MSGMAP_PATH.read_text(encoding="utf-8")) if MSGMAP_PATH.exists() else {}
+    except ValueError:
+        data = {}
+    data[str(message_id)] = {"session": session, "ts": time.time()}
+    # Keep the map bounded: drop entries older than 7 days, cap at 1000.
+    cutoff = time.time() - 7 * 86400
+    data = {k: v for k, v in data.items() if v.get("ts", 0) >= cutoff}
+    if len(data) > 1000:
+        for k in sorted(data, key=lambda k: data[k]["ts"])[: len(data) - 1000]:
+            del data[k]
+    MSGMAP_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _msg_session(message_id) -> str | None:
+    if message_id is None or not MSGMAP_PATH.exists():
+        return None
+    try:
+        return json.loads(MSGMAP_PATH.read_text(encoding="utf-8")).get(str(message_id), {}).get(
+            "session"
+        )
+    except ValueError:
+        return None
+
+
+def _set_active(name: str) -> None:
+    _state_init()
+    ACTIVE_PATH.write_text(name, encoding="utf-8")
+
+
+def _get_active() -> str | None:
+    if ACTIVE_PATH.exists():
+        v = ACTIVE_PATH.read_text(encoding="utf-8").strip()
+        return v or None
+    return None
+
+
+def _broker_alive() -> bool:
+    if not BROKER_PID.exists():
+        return False
+    try:
+        pid = int(BROKER_PID.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)  # signal 0 = liveness probe
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def _call(token: str, method: str, params: dict | None = None, timeout: int = 70):
     url = API.format(token=token, method=method)
     data = urllib.parse.urlencode(params or {}).encode()
@@ -82,6 +208,15 @@ def _call(token: str, method: str, params: dict | None = None, timeout: int = 70
 
 def _send(token: str, chat: str, text: str) -> None:
     _call(token, "sendMessage", {"chat_id": chat, "text": text})
+
+
+def _send_id(token: str, chat: str, text: str, reply_markup: str | None = None):
+    """Send a message and return its message_id (for reply→session routing)."""
+    params = {"chat_id": chat, "text": text}
+    if reply_markup:
+        params["reply_markup"] = reply_markup
+    res = _call(token, "sendMessage", params)
+    return (res.get("result") or {}).get("message_id")
 
 
 def _latest_offset(token: str) -> int:
@@ -118,12 +253,28 @@ def cmd_chat_id(token: str) -> int:
     return 0
 
 
-def cmd_notify(token: str, chat: str, text: str) -> int:
-    _send(token, chat, text)
+def cmd_notify(token: str, chat: str, text: str, session: str | None = None) -> int:
+    if session:
+        # Tag the message and remember its id so a reply routes back here.
+        mid = _send_id(token, chat, f"[{session}] {text}")
+        _record_msgmap(mid, session)
+    else:
+        _send(token, chat, text)
     return 0
 
 
-def cmd_ask(token: str, chat: str, allowed: set[str], question: str, timeout: int) -> int:
+def cmd_ask(
+    token: str, chat: str, allowed: set[str], question: str, timeout: int, session: str | None = None
+) -> int:
+    if session:
+        # Broker mode: send the (tagged) question, then wait on our inbox — the
+        # broker owns getUpdates, so we must not poll it ourselves.
+        if not _broker_alive():
+            sys.stderr.write("No broker running. Start one with: telegram.py broker\n")
+            return 2
+        mid = _send_id(token, chat, f"❓ [{session}] {question}\n\n(Responde a este mensaje.)")
+        _record_msgmap(mid, session)
+        return _wait_inbox(session, timeout)
     offset = _latest_offset(token)
     _send(token, chat, "❓ " + question + "\n\n(Reply to this message; the agent is waiting.)")
     deadline = time.time() + timeout
@@ -150,7 +301,9 @@ def cmd_ask(token: str, chat: str, allowed: set[str], question: str, timeout: in
 _STOP_WORDS = {"/stop", "stop", "para", "parar", "detente", "stop listening", "deja de escuchar"}
 
 
-def cmd_listen(token: str, chat: str, allowed: set[str], timeout: int) -> int:
+def cmd_listen(
+    token: str, chat: str, allowed: set[str], timeout: int, session: str | None = None
+) -> int:
     """Wait (silently, no message sent) for the next allow-listed message.
 
     Designed to run as a BACKGROUND process: the long-poll is pure network, so
@@ -160,6 +313,13 @@ def cmd_listen(token: str, chat: str, allowed: set[str], timeout: int) -> int:
       - prints "__STOP__" + returns 4         → user asked to stop the loop
       - returns 3                             → timed out with no message
     """
+    if session:
+        # Broker mode: register and wait on our local inbox (the broker routes).
+        if not _broker_alive():
+            sys.stderr.write("No broker running. Start one with: telegram.py broker\n")
+            return 2
+        _heartbeat(session)
+        return _wait_inbox(session, timeout)
     offset = _latest_offset(token)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -184,6 +344,133 @@ def cmd_listen(token: str, chat: str, allowed: set[str], timeout: int) -> int:
             return 0
     sys.stderr.write("No message within timeout.\n")
     return 3
+
+
+def _wait_inbox(name: str, timeout: int) -> int:
+    """Session side of broker mode: heartbeat + wait on our local inbox.
+
+    Same contract as `listen`/`ask`: prints the message on stdout and returns 0,
+    prints "__STOP__" and returns 4 on a stop sentinel, returns 3 on timeout.
+    Pure local-disk polling — costs zero model tokens while idle.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _heartbeat(name)
+        msg = _dequeue(name)
+        if msg is not None:
+            if msg == STOP_TOKEN:
+                print("__STOP__")
+                return 4
+            print(msg)
+            return 0
+        time.sleep(1.0)
+    sys.stderr.write("No message within timeout.\n")
+    return 3
+
+
+def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
+    """Single consumer of getUpdates that routes messages to session inboxes.
+
+    Routing precedence for an incoming message:
+      1. it is a reply to a tagged message  → that message's session
+      2. it starts with "<session>: ..."    → that live session (prefix stripped)
+      3. /sessions (or /sesiones)            → show an inline menu of live sessions
+      4. a stop word                         → stop the active/target session
+      5. otherwise                           → the active session, or the only live
+         one; if ambiguous, ask the user to pick (message is not lost-routed).
+    """
+    if _broker_alive():
+        sys.stderr.write("A broker is already running.\n")
+        return 1
+    _state_init()
+    BROKER_PID.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        offset = _latest_offset(token)
+        _send(token, chat, "🧭 Broker activo. Enrutado multi-sesión en marcha.")
+        while True:
+            res = _call(
+                token,
+                "getUpdates",
+                {"timeout": 50, "offset": offset, "allowed_updates": '["message","callback_query"]'},
+                timeout=70,
+            )
+            for up in res.get("result", []):
+                offset = up["update_id"] + 1
+                _handle_update(token, chat, allowed, up)
+    finally:
+        BROKER_PID.unlink(missing_ok=True)
+
+
+def _menu(token: str, chat: str) -> None:
+    live = _live_sessions()
+    if not live:
+        _send(token, chat, "No hay sesiones activas ahora mismo.")
+        return
+    keyboard = [[{"text": n, "callback_data": f"sess:{n}"}] for n in live]
+    _send_id(token, chat, "Elige la sesión destino:", json.dumps({"inline_keyboard": keyboard}))
+
+
+def _handle_update(token: str, chat: str, allowed: set[str], up: dict) -> None:
+    cb = up.get("callback_query")
+    if cb:
+        sender = str((cb.get("from") or {}).get("id"))
+        data = cb.get("data") or ""
+        if sender in allowed and data.startswith("sess:"):
+            name = data[5:]
+            _set_active(name)
+            _send(token, chat, f"✅ Sesión activa: {name}")
+        _call(token, "answerCallbackQuery", {"callback_query_id": cb.get("id")})
+        return
+
+    msg = up.get("message") or up.get("edited_message")
+    if not msg:
+        return
+    if str(msg.get("chat", {}).get("id")) not in allowed:
+        return  # ignore anyone not on the allowlist
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+
+    live = _live_sessions()
+
+    # 3. menu command
+    if text.lower() in ("/sessions", "/sesiones", "/s"):
+        _menu(token, chat)
+        return
+
+    # 1. reply to a tagged message → its session
+    reply = msg.get("reply_to_message") or {}
+    target = _msg_session(reply.get("message_id")) if reply else None
+
+    # 2. "<session>: rest" prefix
+    if target is None and ":" in text:
+        head, rest = text.split(":", 1)
+        if head.strip() in live:
+            target, text = head.strip(), rest.strip()
+
+    # 4. stop word
+    is_stop = text.lower() in _STOP_WORDS
+
+    # 5. fallback to active / sole live session
+    if target is None:
+        active = _get_active()
+        if active in live:
+            target = active
+        elif len(live) == 1:
+            target = live[0]
+
+    if target is None:
+        _send(token, chat, "¿Para qué sesión? Responde a un mensaje suyo, usa 'nombre: ...' o /sessions.")
+        return
+
+    if is_stop:
+        _enqueue(target, STOP_TOKEN)
+        _send(token, chat, f"🛑 [{target}] listener detenido.")
+        return
+
+    _set_active(target)
+    _enqueue(target, text)
+    _send(token, chat, f"📥 [{target}] recibido, trabajando en ello…")
 
 
 def cmd_test(token: str, chat: str, allowed: set[str]) -> int:
@@ -225,31 +512,43 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
+    def _pop(args: list[str], flag: str) -> tuple[str | None, list[str]]:
+        if flag in args:
+            i = args.index(flag)
+            return args[i + 1], args[:i] + args[i + 2 :]
+        return None, args
+
     if cmd == "notify":
-        if len(argv) < 2:
-            sys.stderr.write("Usage: telegram.py notify <text>\n")
+        args = argv[1:]
+        session, args = _pop(args, "--session")
+        if not args:
+            sys.stderr.write("Usage: telegram.py notify <text> [--session NAME]\n")
             return 2
-        return cmd_notify(token, chat, " ".join(argv[1:]))
+        return cmd_notify(token, chat, " ".join(args), session)
 
     if cmd == "ask":
         args = argv[1:]
-        timeout = int(os.environ.get("TELEGRAM_ASK_TIMEOUT", "21600"))
-        if "--timeout" in args:
-            i = args.index("--timeout")
-            timeout = int(args[i + 1])
-            args = args[:i] + args[i + 2 :]
+        session, args = _pop(args, "--session")
+        to, args = _pop(args, "--timeout")
+        timeout = int(to) if to else int(os.environ.get("TELEGRAM_ASK_TIMEOUT", "21600"))
         if not args:
-            sys.stderr.write("Usage: telegram.py ask <question> [--timeout seconds]\n")
+            sys.stderr.write("Usage: telegram.py ask <question> [--timeout N] [--session NAME]\n")
             return 2
-        return cmd_ask(token, chat, allowed, " ".join(args), timeout)
+        return cmd_ask(token, chat, allowed, " ".join(args), timeout, session)
 
     if cmd == "listen":
         args = argv[1:]
-        timeout = int(os.environ.get("TELEGRAM_LISTEN_TIMEOUT", "21600"))
-        if "--timeout" in args:
-            i = args.index("--timeout")
-            timeout = int(args[i + 1])
-        return cmd_listen(token, chat, allowed, timeout)
+        session, args = _pop(args, "--session")
+        to, args = _pop(args, "--timeout")
+        timeout = int(to) if to else int(os.environ.get("TELEGRAM_LISTEN_TIMEOUT", "21600"))
+        return cmd_listen(token, chat, allowed, timeout, session)
+
+    if cmd == "broker":
+        return cmd_broker(token, chat, allowed)
+
+    if cmd == "sessions":
+        print("\n".join(_live_sessions()) or "(no live sessions)")
+        return 0
 
     if cmd == "test":
         return cmd_test(token, chat, allowed)
