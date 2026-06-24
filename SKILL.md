@@ -154,3 +154,52 @@ Notes:
   `3` = timed out (don't assume — park the work), `2` = not configured.
 - Keep messages short and human; the user reads them on a phone.
 - This is a side channel, not a log — send what a human actually wants to know.
+
+## Driving the agent FROM Telegram (`listen`) — token-efficient loop
+
+`listen` lets the **user send new instructions from Telegram** without the
+Claude app open in front of them. The trick that keeps it cheap: the polling is
+done by the **background shell process**, not by the model.
+
+```bash
+# Run in the BACKGROUND (e.g. Claude Code's run_in_background). It long-polls
+# Telegram and blocks — pure network, ZERO model tokens while idle.
+python3 .../scripts/telegram.py listen
+```
+
+Exit codes drive the loop:
+- `0` → a new message arrived; its text is on **stdout**. The agent is
+  re-invoked **once**, acts on the instruction, then **relaunches `listen`** in
+  the background.
+- `4` → the user sent a stop word (`stop`, `para`, `/stop`, `parar`, `detente`,
+  "deja de escuchar"). The agent **does not relaunch** → the loop ends.
+- `3` → timed out (`TELEGRAM_LISTEN_TIMEOUT`, default 6h) with no message; the
+  agent may relaunch (one cheap turn) or stop.
+
+### Why this barely costs tokens
+
+- **While waiting:** the background process is just an HTTP long-poll to
+  Telegram. The model is not running, so **0 tokens** are spent — for minutes or
+  hours.
+- **Per message:** the model wakes up exactly once (when `listen` exits),
+  handles that one instruction, relaunches `listen`, and goes idle again. So
+  token cost scales with the **number of messages you send**, not with elapsed
+  time. (A naive "model polls every N seconds" loop, by contrast, re-bills the
+  whole conversation context every tick — that's the expensive thing to avoid.)
+
+### Is keeping the session alive a problem?
+
+Mostly no, with three caveats:
+- The host machine must stay awake and online (the background process lives in
+  that session).
+- Each handled message adds to the transcript, so a very long-lived loop slowly
+  grows context (later turns cost a bit more until the harness compacts). Fine
+  for hours; for days, restart the loop occasionally.
+- Always relaunch with a long `--timeout` so idle time doesn't trigger needless
+  model wake-ups.
+
+### How to stop it
+
+- From Telegram: send `stop` / `para` / `/stop` → clean end (exit 4).
+- Locally: stop/kill the background `listen` task (e.g. Claude Code's task-stop),
+  or just don't relaunch it after the next message.

@@ -17,12 +17,14 @@ Config — the skill's OWN .env (this skill dir / .env; gitignored), or OS env:
   TELEGRAM_CHAT_ID=123456789              # your chat id (see `chat-id`)
   TELEGRAM_ALLOWED_CHAT_IDS=123456789     # optional; defaults to TELEGRAM_CHAT_ID
   TELEGRAM_ASK_TIMEOUT=21600              # optional; seconds `ask` waits (def 6h)
+  TELEGRAM_LISTEN_TIMEOUT=21600           # optional; seconds `listen` waits (def 6h)
 
 Commands:
   telegram.py status                      # is it configured? (no secrets shown)
   telegram.py chat-id                     # list recent chats to find your id
   telegram.py notify "text"               # send progress/info (non-blocking)
   telegram.py ask "question" [--timeout N] # ask + WAIT; prints the reply on stdout
+  telegram.py listen [--timeout N]        # WAIT for the next user msg (run in background)
   telegram.py test                        # end-to-end check (notify + ask round-trip)
 """
 
@@ -145,6 +147,45 @@ def cmd_ask(token: str, chat: str, allowed: set[str], question: str, timeout: in
     return 3
 
 
+_STOP_WORDS = {"/stop", "stop", "para", "parar", "detente", "stop listening", "deja de escuchar"}
+
+
+def cmd_listen(token: str, chat: str, allowed: set[str], timeout: int) -> int:
+    """Wait (silently, no message sent) for the next allow-listed message.
+
+    Designed to run as a BACKGROUND process: the long-poll is pure network, so
+    it costs zero model tokens while idle. It exits only when something happens,
+    which re-invokes the agent exactly once:
+      - prints the message text + returns 0  → a new instruction to act on
+      - prints "__STOP__" + returns 4         → user asked to stop the loop
+      - returns 3                             → timed out with no message
+    """
+    offset = _latest_offset(token)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        poll = max(1, min(50, int(deadline - time.time())))
+        res = _call(token, "getUpdates", {"timeout": poll, "offset": offset}, timeout=poll + 20)
+        for up in res.get("result", []):
+            offset = up["update_id"] + 1
+            msg = up.get("message") or up.get("edited_message")
+            if not msg:
+                continue
+            if str(msg.get("chat", {}).get("id")) not in allowed:
+                continue  # ignore anyone not on the allowlist
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            if text.lower() in _STOP_WORDS:
+                _send(token, chat, "🛑 Listener detenido.")
+                print("__STOP__")
+                return 4
+            _send(token, chat, "📥 Recibido, trabajando en ello…")
+            print(text)  # the user's instruction → stdout for the agent
+            return 0
+    sys.stderr.write("No message within timeout.\n")
+    return 3
+
+
 def cmd_test(token: str, chat: str, allowed: set[str]) -> int:
     _send(token, chat, "🔧 telegram-bridge test: progress messages work.")
     print("Sent a test notification. Now asking a confirmation question…")
@@ -201,6 +242,14 @@ def main(argv: list[str]) -> int:
             sys.stderr.write("Usage: telegram.py ask <question> [--timeout seconds]\n")
             return 2
         return cmd_ask(token, chat, allowed, " ".join(args), timeout)
+
+    if cmd == "listen":
+        args = argv[1:]
+        timeout = int(os.environ.get("TELEGRAM_LISTEN_TIMEOUT", "21600"))
+        if "--timeout" in args:
+            i = args.index("--timeout")
+            timeout = int(args[i + 1])
+        return cmd_listen(token, chat, allowed, timeout)
 
     if cmd == "test":
         return cmd_test(token, chat, allowed)
