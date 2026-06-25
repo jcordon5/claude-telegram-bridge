@@ -183,6 +183,27 @@ Exit codes drive the loop:
 - `3` → timed out (`TELEGRAM_LISTEN_TIMEOUT`, default 6h) with no message; the
   agent may relaunch (one cheap turn) or stop.
 
+### INVARIANT — keep exactly one listener alive; relaunch on ANY exit but `4`
+
+This is the rule that makes Telegram-driving reliable, and the easiest one to get
+wrong. While the user is driving via Telegram, there must **always be one `listen`
+running**. A `listen` can end for reasons *other* than a delivered message — most
+commonly the host **kills the background task when the user types in the Claude
+app** (typing in the app interrupts background processes), or it times out.
+
+So whenever a `listen` you launched ends — exit `0`, exit `3`, **or a "killed" /
+"stopped" task notification** — you MUST **immediately relaunch it**. The ONLY
+case where you do *not* relaunch is exit `4` (the user sent a stop word).
+
+- Never answer a `listen` kill/stop notification with "nothing to do" and move on.
+  That leaves **no consumer**, so the user's next Telegram message strands (it
+  queues in Telegram; the durable offset means it's not lost, but it won't be
+  acted on until a `listen` runs again).
+- If you ever finish a turn while the user is still driving via Telegram, make
+  sure a `listen` is running before you stop.
+- Tell the user this trade-off once: **typing in the app stops the loop**; if they
+  want it to keep running untouched, drive only from Telegram.
+
 ### Why this barely costs tokens
 
 - **While waiting:** the background process is just an HTTP long-poll to
