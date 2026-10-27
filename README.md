@@ -81,11 +81,11 @@ stdlib helper with a group ID supplied explicitly or via
 `TELEGRAM_GROUP_CHAT_ID`. Replace the example ID with your own:
 
 ```bash
-python3 scripts/group.py --chat -123456789 --label Codex status
-python3 scripts/group.py --chat -123456789 --label Codex notify 'The first draft is ready.'
-python3 scripts/group.py --chat -123456789 --label Codex listen --batch --timeout 21600
-python3 scripts/group.py --chat -123456789 --label Codex ask 'How many pages do you need?'
-python3 scripts/group.py --chat -123456789 --label Codex send-file /path/to/draft.pdf --caption 'Draft'
+python3 scripts/group.py --chat -123456789 --label Agent status
+python3 scripts/group.py --chat -123456789 --label Agent notify 'The first draft is ready.'
+python3 scripts/group.py --chat -123456789 --label Agent listen --batch --timeout 21600
+python3 scripts/group.py --chat -123456789 --label Agent ask 'How many pages do you need?'
+python3 scripts/group.py --chat -123456789 --label Agent send-file /path/to/draft.pdf --caption 'Draft'
 python3 scripts/group.py --chat -123456789 download FILE_ID /path/to/reference.pdf
 python3 scripts/group.py --chat -123456789 history --limit 50
 ```
@@ -125,8 +125,6 @@ The waiting process uses no model tokens while idle. Continuing the agent when
 it exits depends on the host delivering tool completion to the agent; a skill
 alone does not establish a permanent wakeup service after a completed turn.
 Keep the host awake and test that lifecycle in the chosen agent environment.
-
-Run the offline regression suite with `python3 -m unittest discover -s tests -v`.
 
 ## Drive Claude from Telegram (send it prompts from your phone)
 
