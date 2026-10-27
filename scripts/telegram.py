@@ -52,6 +52,17 @@ from pathlib import Path
 
 API = "https://api.telegram.org/bot{token}/{method}"
 
+
+class TelegramAPIError(SystemExit):
+    """Preserve CLI errors while exposing Telegram's structured parameters."""
+    def __init__(self, status: int, body: str):
+        super().__init__(f"Telegram API error {status}: {body}")
+        self.status = status
+        try:
+            self.parameters = json.loads(body).get("parameters", {})
+        except (ValueError, AttributeError):
+            self.parameters = {}
+
 # Config lives INSIDE the skill (gitignored), not in the project that uses it.
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = SKILL_ROOT / ".env"
@@ -124,7 +135,11 @@ def _enqueue(name: str, text: str) -> None:
     box.mkdir(parents=True, exist_ok=True)
     # Monotonic-ish name so dequeue order is FIFO even within the same second.
     seq = f"{time.time():.6f}_{os.getpid()}"
-    (box / f"{seq}.txt").write_text(text, encoding="utf-8")
+    pending = box / f".{seq}.tmp"
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(text)
+    os.replace(pending, box / f"{seq}.txt")
 
 
 def _dequeue(name: str) -> str | None:
@@ -256,7 +271,7 @@ def _call(token: str, method: str, params: dict | None = None, timeout: int = 70
             return json.load(resp)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
-        raise SystemExit(f"Telegram API error {exc.code}: {body}")
+        raise TelegramAPIError(exc.code, body) from None
     except urllib.error.URLError as exc:
         raise SystemExit(f"Could not reach Telegram: {exc}")
 
@@ -475,7 +490,7 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
             res = _call(
                 token,
                 "getUpdates",
-                {"timeout": 50, "offset": offset, "allowed_updates": '["message","callback_query"]'},
+                {"timeout": 50, "offset": offset, "allowed_updates": '["message","edited_message","callback_query"]'},
                 timeout=70,
             )
             for up in res.get("result", []):
@@ -498,7 +513,7 @@ def cmd_broker(token: str, chat: str, allowed: set[str]) -> int:
                 announced_multi = True
             elif len(live) <= 1:
                 announced_multi = False  # re-arm for the next time it grows
-            if live:
+            if live or _group_routes_live():
                 last_active = time.time()
             elif time.time() - last_active > idle_shutdown:
                 break
@@ -521,7 +536,118 @@ def _menu(token: str, chat: str) -> None:
     _send_id(token, chat, "Elige la sesión destino:", json.dumps({"inline_keyboard": keyboard}))
 
 
+def _registered_group_route(chat_id: str) -> dict | None:
+    import re
+
+    if not re.fullmatch(r"-\d+", chat_id):
+        return None
+    path = STATE_DIR / "group_routes" / f"{chat_id}.json"
+    try:
+        route = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(route, dict) or not re.fullmatch(r"tg-group-[a-zA-Z0-9_-]{1,96}", str(route.get("session", ""))):
+        return None
+    return route if str(route.get("chat_id")) == chat_id else None
+
+
+def _group_routes_live() -> bool:
+    for path in (STATE_DIR / "group_routes").glob("-*.json"):
+        route = _registered_group_route(path.stem)
+        if route:
+            try:
+                if time.time() - float(route.get("heartbeat", 0)) <= HEARTBEAT_TTL:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _register_group_migration(old_chat: str, new_chat: str) -> None:
+    """Follow Telegram's authenticated migration signal for an authorized group."""
+    import re
+
+    if not re.fullmatch(r"-\d+", new_chat) or old_chat == new_chat:
+        raise ValueError("Invalid group migration")
+    previous = _registered_group_route(old_chat)
+    if not previous:
+        raise ValueError("Cannot migrate an unregistered group")
+    current = _registered_group_route(new_chat) or dict(previous, chat_id=new_chat)
+    current.pop("migrated_to", None)
+    current["migrated_from"] = sorted(set(current.get("migrated_from", [])) | {old_chat})
+    previous["migrated_to"] = new_chat
+    folder = STATE_DIR / "group_routes"
+    for route in (current, previous):
+        target = folder / f"{route['chat_id']}.json"
+        pending = folder / f".{route['chat_id']}.{os.getpid()}.{time.time_ns()}.tmp"
+        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(route, output)
+        os.replace(pending, target)
+
+
+def _journal_group_message(msg: dict, direction: str) -> None:
+    """Keep only observed messages, scoped by chat; no historical API claims."""
+    import re
+
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    message_id = str(msg.get("message_id", ""))
+    if not re.fullmatch(r"-\d+", chat_id) or not re.fullmatch(r"\d+", message_id):
+        raise ValueError("Invalid group message identity")
+    folder = STATE_DIR / "group_history" / chat_id
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = folder / f"{message_id}.json"
+    pending = folder / f".{message_id}.{os.getpid()}.{time.time_ns()}.tmp"
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        json.dump({"direction": direction, "observed_at": time.time(), "message": msg}, output, ensure_ascii=False)
+    os.replace(pending, target)
+
+
+def _route_registered_group(up: dict) -> bool:
+    msg = up.get("message") or up.get("edited_message")
+    if not msg:
+        return False
+    route = _registered_group_route(str(msg.get("chat", {}).get("id", "")))
+    if not route and msg.get("migrate_from_chat_id"):
+        old_chat = str(msg["migrate_from_chat_id"])
+        if _registered_group_route(old_chat):
+            _register_group_migration(old_chat, str(msg["chat"]["id"]))
+            route = _registered_group_route(str(msg["chat"]["id"]))
+    if not route:
+        return False
+    if msg.get("migrate_to_chat_id"):
+        _register_group_migration(str(msg["chat"]["id"]), str(msg["migrate_to_chat_id"]))
+    if msg.get("from", {}).get("is_bot"):
+        return True
+    _journal_group_message(msg, "incoming")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    files = {k: msg[k] for k in ("document", "photo", "audio", "voice", "video", "animation", "video_note", "sticker") if k in msg}
+    # Ordinary phrases such as "para" remain conversation for the agent to
+    # interpret. Only an explicit command stops transport unconditionally.
+    if text.lower() == "/stop":
+        _enqueue(route["session"], STOP_TOKEN)
+        return True
+    payload = {
+        "chat_id": msg["chat"]["id"],
+        "message_id": msg["message_id"],
+        "date": msg.get("date"),
+        "sender": msg.get("from", {}),
+        "text": text,
+        "attachments": files,
+        "reply_to_message_id": msg.get("reply_to_message", {}).get("message_id"),
+        "edited": "edited_message" in up,
+        "message": msg,
+    }
+    _enqueue(route["session"], json.dumps(payload, ensure_ascii=False))
+    return True
+
+
 def _handle_update(token: str, chat: str, allowed: set[str], up: dict) -> None:
+    # Explicit group routes share this consumer without changing private-chat
+    # configuration. Group messages never enter private session routing.
+    if _route_registered_group(up):
+        return
     cb = up.get("callback_query")
     if cb:
         sender = str((cb.get("from") or {}).get("id"))

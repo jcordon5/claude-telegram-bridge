@@ -1,7 +1,7 @@
 ---
 name: telegram-bridge
 description: >-
-  Lets Claude reach the user on Telegram during long or unattended runs — to
+  Lets agents such as Claude and Codex reach the user on Telegram during long or unattended runs — to
   send progress updates and, crucially, to ask BLOCKING questions and WAIT for
   the user's reply before continuing. Use this skill whenever you're working
   autonomously toward a goal for a while and the user may be away from the
@@ -22,7 +22,49 @@ questions that **block until they answer**, then do exactly what they say. This
 keeps long autonomous runs moving without the user babysitting the terminal, and
 without you guessing on decisions that are theirs to make.
 
-All logic is in `scripts/telegram.py` (stdlib only, no installs).
+The private text workflow is in `scripts/telegram.py`; the optional group and
+file workflow is in `scripts/group.py` (stdlib only, no installs).
+
+## Group conversations and files (optional, agent-agnostic)
+
+Use `scripts/group.py --chat GROUP_ID --label AGENT_NAME` for an explicitly
+authorized group, preserving the original private `.env` settings. It supports
+`notify TEXT`, `ask TEXT`, `listen --batch --timeout SECONDS`, `drain`,
+`history --limit N`, `send-file PATH --caption TEXT`, and
+`download FILE_ID DESTINATION`. Group IDs and optional defaults belong in local
+configuration, not this skill or repository. Text-only private commands below
+continue unchanged. One group has one active route; use `--session NAME` when
+selecting its owning agent session.
+
+For natural group use, receive all delivered messages and let the agent decide
+whether to answer, join the conversation, take a task, or stay silent. Do not
+treat every message as a new task, auto-acknowledge every message, or require
+people to use replies, mentions or prefixes. A question can remain pending while
+unrelated group conversation continues. Group `ask` defaults to unrestricted
+message receipt; exact reply matching is available only with `--strict-reply`.
+Use the same conversational language and tone as the group. Send meaningful
+progress during ongoing work and actual output files when ready. Respect the
+user's authorization scope when interpreting group requests.
+
+First check `status`: all normal messages reach the bot only when it is a group
+administrator or privacy mode is disabled (the latter requires re-adding the
+bot). Explain the necessary Telegram-side step if access is restricted; do not
+claim a script change bypasses it. Use the skill and API for this workflow;
+opening a desktop client is not an automatic fallback.
+
+`listen` emits sender, text, raw message, edit state and attachment metadata as
+JSON. With `--batch`, it emits an array. Use the largest photo's `file_id` or the
+document/audio/voice `file_id` to download files, then actually inspect them.
+`drain` checks feedback between work steps. No model tokens are used by the
+waiting process. Only `/stop` is an unconditional transport stop in group mode;
+interpret natural stop requests in context. Private stop behavior is unchanged.
+
+`history` includes only locally observed incoming/outgoing group messages;
+Telegram's Bot API cannot fetch arbitrary older chat history. Do not invent
+unseen instructions or claim to have read old files without retrieving them.
+The common broker remains the only `getUpdates` consumer. Keep the agent turn
+active while waiting unless the host's automatic wakeup behavior is verified;
+an exited shell listener does not itself establish permanent agent availability.
 
 ## Golden rule — once this skill is in use, ask ONLY via Telegram
 

@@ -1,6 +1,6 @@
 # telegram-bridge
 
-A reusable **Claude skill** that lets your AI agent reach you on **Telegram**
+A reusable skill for **Claude, Codex, and other agents** that lets your AI agent reach you on **Telegram**
 while it works on long or unattended tasks — to send progress updates and,
 crucially, to **ask blocking questions and wait for your reply** before
 continuing. So you can step away from the computer and the agent still keeps
@@ -15,12 +15,15 @@ the keyboard: it either **stops** at the first decision it can't make, or it
 
 ## Security (allowlist)
 
-- The bot only **sends** to your own chat, so a stranger who finds the bot never
+- Private-chat commands only **send** to your own chat, so a stranger who finds the bot never
   sees your messages.
 - Inbound replies are accepted **only** from allow-listed chat ids
   (`TELEGRAM_ALLOWED_CHAT_IDS`, defaults to your `TELEGRAM_CHAT_ID`). Anyone else
   who writes to the bot is **ignored** — they can't answer on your behalf or
   drive the agent.
+- Optional group mode explicitly registers a separate group destination and
+  queue. Members of that group can contribute messages and attachments; this
+  does not change the private-chat configuration or allowlist.
 
 ## Install
 
@@ -70,6 +73,60 @@ python3 scripts/telegram.py test          # end-to-end check
 
 `ask`/`listen` exit codes: `0` answered (reply/message on stdout), `3` timed out,
 `2` not configured. `listen` also returns `4` when you send a stop word.
+
+## Natural group conversations and attachments (optional)
+
+Keep the existing `.env` and private commands unchanged. Use the additional
+stdlib helper with a group ID supplied explicitly or via
+`TELEGRAM_GROUP_CHAT_ID`. Replace the example ID with your own:
+
+```bash
+python3 scripts/group.py --chat -123456789 --label Codex status
+python3 scripts/group.py --chat -123456789 --label Codex notify 'The first draft is ready.'
+python3 scripts/group.py --chat -123456789 --label Codex listen --batch --timeout 21600
+python3 scripts/group.py --chat -123456789 --label Codex ask 'How many pages do you need?'
+python3 scripts/group.py --chat -123456789 --label Codex send-file /path/to/draft.pdf --caption 'Draft'
+python3 scripts/group.py --chat -123456789 download FILE_ID /path/to/reference.pdf
+python3 scripts/group.py --chat -123456789 history --limit 50
+```
+
+One shared broker consumes Telegram updates for both modes. A registered group
+has one active inbox, separate from private sessions; `--session NAME` selects
+its owner. `drain` retrieves queued messages without waiting, and `listen
+--batch` returns a JSON array of currently queued messages once the first
+arrives. Sender identity, edit state and attachment metadata are retained.
+Text, files, photos, voice messages, stickers and other content can be delivered
+without requiring a reply-to, mention or command. The **agent** decides whether
+a message is casual conversation, feedback, a task, or needs no answer. Receipt
+does not automatically send a "working" acknowledgement. Plain words such as
+`para` remain available for contextual interpretation; `/stop` stops the group
+listener explicitly. The original private-session stop words remain unchanged.
+
+**Telegram must deliver those messages first:** make the bot an administrator
+in the selected group, or disable its privacy mode through BotFather and re-add
+it. The helper cannot change those permissions itself. `status` reports the
+effective group access. See [Telegram privacy mode](https://core.telegram.org/bots/features#privacy-mode).
+
+Group `ask` accepts any next delivered message by default. `--strict-reply`
+opts into exact reply-to matching. The caller interprets the response in context
+and can keep listening if it is unrelated to the pending question.
+
+When Telegram upgrades a registered group to a supergroup, the bridge follows
+its migration service message or structured migration error, preserving the
+queue and local history. Existing group IDs continue to resolve to the new ID.
+
+`history` reads a local archive of group messages actually observed by the
+bridge, including files it sent. It is **not** a Telegram history API and cannot
+recover messages from before the bot joined or updates already consumed before
+archiving was enabled. Runtime state stays under `~/.telegram-bridge/`, outside
+the repository. No bot tokens or real group IDs belong in commits.
+
+The waiting process uses no model tokens while idle. Continuing the agent when
+it exits depends on the host delivering tool completion to the agent; a skill
+alone does not establish a permanent wakeup service after a completed turn.
+Keep the host awake and test that lifecycle in the chosen agent environment.
+
+Run the offline regression suite with `python3 -m unittest discover -s tests -v`.
 
 ## Drive Claude from Telegram (send it prompts from your phone)
 
